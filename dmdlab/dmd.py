@@ -621,15 +621,13 @@ class biDMDc:
     def zero_control(self, n_steps=None):
         n_steps = len(self.orig_timesteps) if n_steps is None else n_steps
         return np.zeros([self.Ups.shape[0], n_steps])
+
+
+
 class ibiDMD(biDMD):
     """
-    Incremental Bilinear Dynamic Mode Decomposition (ibiDMD).
-    This class learns the system matrices A and B incrementally using
-    Recursive Least-Squares (RLS). It takes the same arguments as biDMD
-    but processes the data column-by-column to simulate an online
-    learning environment.
-
-    The model is X2 = A X1 + U B X1.
+    Incremental Bilinear Dynamic Mode Decomposition (ibiDMD) with optional
+    forgetting factor for tracking time-varying systems.
     """
     def __init__(self, X2, X1, U, ts, **kwargs):
         """
@@ -646,18 +644,15 @@ class ibiDMD(biDMD):
             shift (int): Number of time delays. default 0.
             p_alpha (float): Initialization value for the covariance matrix P.
                              P is initialized to p_alpha * I. Default 1e6.
+            forgetting_factor (float): Forgetting factor (lambda) for tracking
+                                       drifting systems. Must be between 0 and 1.
+                                       Default is 1.0 (standard RLS).
+            track_history (bool): If True, stores error and eigenvalue history
+                                  for analysis. This requires looking at the
+                                  full X2 matrix upfront, making it not purely
+                                  online. Defaults to False.
         """
         # --- Stage 1: Initialization ---
-        # Inherit basic properties and methods like predict_dst from biDMD
-        # We call super().__init__ but will overwrite the learned matrices.
-        # This is a simple way to get all the attributes set up.
-        # We pass dummy arrays to avoid doing the expensive batch computation.
-        dummy_X = np.zeros((X1.shape[0], 2))
-        dummy_U = np.zeros((U.shape[0], 2))
-        dummy_ts = np.array([0, 1])
-        super().__init__(dummy_X[:,1:], dummy_X[:,:-1], dummy_U, dummy_ts, **kwargs)
-
-        # Now, set the actual data
         self.U = U
         self.X1 = X1
         self.X2 = X2
@@ -665,74 +660,98 @@ class ibiDMD(biDMD):
         self.dt = ts[1] - ts[0]
         self.orig_timesteps = ts if len(ts) == self.X1.shape[1] else ts[:-1]
         self.shift = kwargs.get('shift', 0)
-        
+        self.forgetting_factor = kwargs.get('forgetting_factor', 1.0)
+        track_history = kwargs.get('track_history', False)
+
+        if not (0 < self.forgetting_factor <= 1.0):
+            raise ValueError("Forgetting factor must be in the interval (0, 1].")
+
         # Get dimensions
-        n_x1 = self.X1.shape[0]
+        n_x1, n_time = self.X1.shape
         n_x2 = self.X2.shape[0]
         n_u = self.U.shape[0]
-        n_time = self.X1.shape[1]
         
-        # Calculate the size of the bilinear term 'Ups'
-        # This logic is borrowed from the batch biDMD
         delay_dim = self.shift + 1
         n_ups = (n_u // delay_dim) * (n_x1 // delay_dim) * delay_dim**2
+        dim_xi = n_x1 + n_ups
         
-        dim_xi = n_x1 + n_ups # Dimension of the augmented state vector ξ
-        
-        # Initialize G = [A, B] and the inverse covariance matrix P
         G = np.zeros((n_x2, dim_xi))
         p_alpha = kwargs.get('p_alpha', 1e6)
         P = np.identity(dim_xi) * p_alpha
+        
+        # --- History Tracking Initialization (Optional) ---
+        if track_history:
+            self.error_history = []
+            self.eigs_history = []
+            threshold = kwargs.get('threshold', None)
+            if threshold is None:
+                U_svd, _, _ = svd(self.X2, full_matrices=False)
+            else:
+                threshold_type = kwargs.get('threshold_type', 'percent')
+                U_svd, _, _ = _threshold_svd(self.X2, threshold, threshold_type)
+        else:
+            self.error_history = None
+            self.eigs_history = None
 
         # --- Stage 2: Incremental Update Loop (RLS) ---
-        # Process each data snapshot one by one
         for t in range(n_time):
-            # Get current data columns
             x1_t = self.X1[:, t]
             x2_t = self.X2[:, t]
             u_t = self.U[:, t]
 
-            # Construct the augmented vector ξ (xi) for this timestep
-            # This replicates the logic from biDMD for a single time column
             _ct = u_t.reshape(self.shift + 1, -1)
             _xt = x1_t.reshape(self.shift + 1, -1)
             ups_t = np.einsum('sc,sm->scm', _ct, _xt).flatten()
             xi_t = np.hstack([x1_t, ups_t])
 
-            # RLS Update Equations
-            # 1. Calculate prediction error (epsilon)
-            epsilon = x2_t - G @ xi_t
+            # RLS Update Equations with Forgetting Factor
+            # 1. Calculate gain vector (K)
+            denominator = self.forgetting_factor + xi_t.T @ P @ xi_t
+            if np.isclose(denominator, 0):
+                K = np.zeros_like(xi_t)
+            else:
+                K = (P @ xi_t) / denominator
 
-            # 2. Calculate gain vector (K)
-            K = (P @ xi_t) / (1 + xi_t.T @ P @ xi_t)
+            # 2. Calculate prediction error (epsilon)
+            epsilon = x2_t - G @ xi_t
+            if track_history:
+                self.error_history.append(np.linalg.norm(epsilon))
 
             # 3. Update system matrix G
             G = G + np.outer(epsilon, K)
 
             # 4. Update inverse covariance matrix P
-            P = P - np.outer(K, xi_t.T @ P)
+            P = (P - np.outer(K, xi_t.T @ P)) / self.forgetting_factor
+
+            # --- Store Eigenvalues for this step (Optional) ---
+            if track_history:
+                try:
+                    current_A = G[:, :n_x1]
+                    current_Atilde = dag(U_svd) @ current_A @ U_svd
+                    current_eigs, _ = eig(current_Atilde)
+                    self.eigs_history.append(current_eigs)
+                except np.linalg.LinAlgError:
+                    self.eigs_history.append(np.full(U_svd.shape[1], np.nan, dtype=np.complex128))
 
         # --- Stage 3: Finalize Matrices and Modes ---
-        # After the loop, G contains the learned [A, B] matrix
         self.A = G[:, :n_x1]
         self.B = G[:, n_x1:]
         
-        # To maintain compatibility with biDMD, we compute Atilde, eigs, and modes.
-        # This requires an SVD of the output data X2 to find a projection basis.
-        threshold = kwargs.get('threshold', None)
-        if threshold is None:
-            U_svd, S_svd, Vt_svd = svd(self.X2, full_matrices=False)
-        else:
-            threshold_type = kwargs.get('threshold_type', 'percent')
-            U_svd, S_svd, Vt_svd = _threshold_svd(self.X2, threshold, threshold_type)
-
+        if not track_history:
+            threshold = kwargs.get('threshold', None)
+            if threshold is None:
+                U_svd, _, _ = svd(self.X2, full_matrices=False)
+            else:
+                threshold_type = kwargs.get('threshold_type', 'percent')
+                U_svd, _, _ = _threshold_svd(self.X2, threshold, threshold_type)
+        
         self.Atilde = dag(U_svd) @ self.A @ U_svd
         self.Btilde = dag(U_svd) @ self.B
         self.eigs, W = eig(self.Atilde)
         self.modes = self.A @ U_svd @ W
         
-        # Also store the full Ups matrix for potential use in prediction methods
         self.Ups = np.einsum('sct, smt->scmt',
                              self.U.reshape(self.shift + 1, -1, n_time),
                              self.X1.reshape(self.shift + 1, -1, n_time)
                              ).reshape(-1, n_time)
+
