@@ -754,4 +754,91 @@ class ibiDMD(biDMD):
                              self.U.reshape(self.shift + 1, -1, n_time),
                              self.X1.reshape(self.shift + 1, -1, n_time)
                              ).reshape(-1, n_time)
+# Paste this entire class at the end of dmdlab/dmd.py
 
+class Bayesian_biDMD(biDMD):
+    """
+    Bayesian Incremental Bilinear Dynamic Mode Decomposition.
+    Inherits from biDMD for data handling and consistency.
+    """
+    def __init__(self, *args, rank=None, forgetting_factor=1.0, **kwargs):
+        # 1. Call the parent constructor robustly with all its expected arguments
+        super().__init__(*args, rank=rank, **kwargs)
+        
+        # 2. Set Bayesian-specific parameters
+        if not (0 < forgetting_factor <= 1.0):
+            raise ValueError("Forgetting factor must be in (0, 1].")
+        self.lam = forgetting_factor
+        
+        self.M_G = None   # Posterior Mean for G
+        self.K_G = None   # Posterior Column Covariance for G
+        self.Psi_G = None # Posterior Scale Matrix for Noise
+        self.nu_G = None  # Posterior Degrees of Freedom for Noise
+
+    def _initialize_hyperparameters(self, state_dim, control_dim):
+        """Initializes the prior hyperparameters."""
+        aug_dim = state_dim * (1 + control_dim)
+        self.M_G = np.zeros((state_dim, aug_dim))
+        self.K_G = np.identity(aug_dim) * 1e6
+        self.Psi_G = np.identity(state_dim) * 1e-3
+        self.nu_G = float(state_dim)
+
+    def _update_hyperparameters(self, xi, x_prime):
+        """Performs a rank-1 update of the posterior."""
+        K_inv = np.linalg.inv(self.K_G)
+        K_inv = self.lam * K_inv + np.outer(xi, xi)
+        self.K_G = np.linalg.inv(K_inv)
+        
+        prediction_error = x_prime - self.M_G @ xi
+        gain = self.K_G @ xi
+        self.M_G = self.M_G + np.outer(prediction_error, gain)
+        
+        self.nu_G = self.lam * self.nu_G + 1
+        self.Psi_G = self.lam * self.Psi_G + np.outer(prediction_error, prediction_error)
+
+    def fit(self):
+        """Overrides the parent fit method for Bayesian incremental learning."""
+        state_dim, num_snapshots = self.X1.shape
+        control_dim = self.U.shape[0]
+
+        self._initialize_hyperparameters(state_dim, control_dim)
+        self.history = {'M_G': [], 'eigenvalues': []}
+
+        print(f"Starting Bayesian Incremental Fit. Total Snapshots: {num_snapshots}")
+        for k in range(num_snapshots):
+            x_k = self.X1[:, k]
+            u_k = self.U[:, k]
+            x_prime_k = self.X2[:, k]
+            xi_k = np.concatenate([x_k, np.kron(u_k, x_k)])
+            self._update_hyperparameters(xi_k, x_prime_k)
+
+        self.G = self.M_G
+        self.A = self.G[:, :state_dim]
+        self.B = self.G[:, state_dim:]
+        
+        U_r, _, _ = np.linalg.svd(self.X1, full_matrices=False)
+        U_r = U_r[:, :self.rank]
+        A_reduced = U_r.T @ self.A @ U_r
+        self.eigs, _ = np.linalg.eig(A_reduced)
+        
+        print("Bayesian fit complete.")
+        return self
+
+    def sample_posterior_G(self, n_samples=100):
+        """Draws samples of the G matrix from the learned posterior."""
+        from scipy.stats import invwishart
+        noise_cov_samples = invwishart.rvs(df=self.nu_G, scale=self.Psi_G, size=n_samples)
+        if n_samples == 1:
+            noise_cov_samples = [noise_cov_samples]
+
+        G_samples = []
+        for Sigma_sample in noise_cov_samples:
+            mean_vec = self.M_G.flatten()
+            Sigma_sample_2d = np.atleast_2d(Sigma_sample)
+            cov_mat = np.kron(self.K_G, Sigma_sample_2d)
+            
+            g_vec_sample = np.random.multivariate_normal(mean_vec, cov_mat)
+            G_sample = g_vec_sample.reshape(self.M_G.shape)
+            G_samples.append(G_sample)
+            
+        return G_samples
