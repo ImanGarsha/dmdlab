@@ -754,26 +754,24 @@ class ibiDMD(biDMD):
                              self.U.reshape(self.shift + 1, -1, n_time),
                              self.X1.reshape(self.shift + 1, -1, n_time)
                              ).reshape(-1, n_time)
-# Paste this entire class at the end of dmdlab/dmd.py
+
+# In dmdlab/dmd.py, replace the old Bayesian_biDMD class with this one.
 
 class Bayesian_biDMD(biDMD):
     """
     Bayesian Incremental Bilinear Dynamic Mode Decomposition.
     Inherits from biDMD for data handling and consistency.
     """
+    
     def __init__(self, *args, rank=None, forgetting_factor=1.0, **kwargs):
-        # 1. Call the parent constructor robustly with all its expected arguments
         super().__init__(*args, rank=rank, **kwargs)
         
-        # 2. Set Bayesian-specific parameters
+        self.rank = rank
         if not (0 < forgetting_factor <= 1.0):
             raise ValueError("Forgetting factor must be in (0, 1].")
         self.lam = forgetting_factor
         
-        self.M_G = None   # Posterior Mean for G
-        self.K_G = None   # Posterior Column Covariance for G
-        self.Psi_G = None # Posterior Scale Matrix for Noise
-        self.nu_G = None  # Posterior Degrees of Freedom for Noise
+        self.M_G, self.K_G, self.Psi_G, self.nu_G = None, None, None, None
 
     def _initialize_hyperparameters(self, state_dim, control_dim):
         """Initializes the prior hyperparameters."""
@@ -802,7 +800,8 @@ class Bayesian_biDMD(biDMD):
         control_dim = self.U.shape[0]
 
         self._initialize_hyperparameters(state_dim, control_dim)
-        self.history = {'M_G': [], 'eigenvalues': []}
+        # CORRECTED: History will now be a list of dictionaries
+        self.history = []
 
         print(f"Starting Bayesian Incremental Fit. Total Snapshots: {num_snapshots}")
         for k in range(num_snapshots):
@@ -811,6 +810,15 @@ class Bayesian_biDMD(biDMD):
             x_prime_k = self.X2[:, k]
             xi_k = np.concatenate([x_k, np.kron(u_k, x_k)])
             self._update_hyperparameters(xi_k, x_prime_k)
+            
+            # CORRECTED: Store the full state of the model at every step
+            current_state = {
+                'M_G': self.M_G.copy(),
+                'K_G': self.K_G.copy(),
+                'Psi_G': self.Psi_G.copy(),
+                'nu_G': self.nu_G
+            }
+            self.history.append(current_state)
 
         self.G = self.M_G
         self.A = self.G[:, :state_dim]
@@ -825,17 +833,10 @@ class Bayesian_biDMD(biDMD):
         return self
     
     def reconstruction_error(self):
-        """
-        Calculates the Frobenius norm of the reconstruction error.
-        This method is added directly to ensure it exists.
-        """
+        """Calculates the Frobenius norm of the reconstruction error."""
         if self.A is None or self.B is None:
-            raise ValueError("The model must be fitted before calculating the reconstruction error.")
-        
-        # Reconstruct the X2 matrix using the posterior mean operators
+            raise ValueError("Model must be fitted.")
         X_prime_reconstructed = self.A.dot(self.X1) + self.B.dot(self.U * self.X1)
-        
-        # Calculate and return the Frobenius norm of the difference
         return np.linalg.norm(self.X2 - X_prime_reconstructed, 'fro')
 
     def sample_posterior_G(self, n_samples=100):
@@ -850,9 +851,14 @@ class Bayesian_biDMD(biDMD):
             mean_vec = self.M_G.flatten()
             Sigma_sample_2d = np.atleast_2d(Sigma_sample)
             cov_mat = np.kron(self.K_G, Sigma_sample_2d)
-            
-            g_vec_sample = np.random.multivariate_normal(mean_vec, cov_mat)
-            G_sample = g_vec_sample.reshape(self.M_G.shape)
-            G_samples.append(G_sample)
+            cov_mat = (cov_mat + cov_mat.T) / 2
+            cov_mat += np.eye(cov_mat.shape[0]) * 1e-6 
+            try:
+                g_vec_sample = np.random.multivariate_normal(mean_vec, cov_mat)
+                G_sample = g_vec_sample.reshape(self.M_G.shape)
+                G_samples.append(G_sample)
+            except np.linalg.LinAlgError:
+                print("Skipping a sample due to non-positive semidefinite covariance matrix.")
+                continue # Skip this sample if it's still not positive-semidefinite
             
         return G_samples
