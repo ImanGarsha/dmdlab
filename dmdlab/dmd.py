@@ -823,6 +823,20 @@ class Bayesian_biDMD(biDMD):
         
         print("Bayesian fit complete.")
         return self
+    
+    def reconstruction_error(self):
+        """
+        Calculates the Frobenius norm of the reconstruction error.
+        This method is added directly to ensure it exists.
+        """
+        if self.A is None or self.B is None:
+            raise ValueError("The model must be fitted before calculating the reconstruction error.")
+        
+        # Reconstruct the X2 matrix using the posterior mean operators
+        X_prime_reconstructed = self.A.dot(self.X1) + self.B.dot(self.U * self.X1)
+        
+        # Calculate and return the Frobenius norm of the difference
+        return np.linalg.norm(self.X2 - X_prime_reconstructed, 'fro')
 
     def sample_posterior_G(self, n_samples=100):
         """Draws samples of the G matrix from the learned posterior."""
